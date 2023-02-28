@@ -1,0 +1,96 @@
+local capabilities = require "st.capabilities"
+local st = require "st"
+local http = require "socket.http"
+local ltn12 = require "ltn12"
+local url = require "socket.url"
+local json = require "dkjson"
+
+-- Define the driver capabilities
+local garage_door_opener_capabilities = {
+    capabilities.switch,
+    capabilities.refresh,
+    capabilities.sensor,
+    capabilities.contactSensor,
+    capabilities.battery,
+}
+
+-- Define the driver function to open or close the garage door
+local function setGarageDoorState(device, command, value, state)
+    local headers = {
+        ["Content-Type"] = "application/json",
+        ["Authorization"] = "Bearer " .. device.authToken
+    }
+    local body = {
+        ["deviceid"] = device.data.device_id,
+        ["command"] = command,
+        ["value"] = value,
+        ["state"] = state
+    }
+    local requestBody = json.encode(body)
+    local url = "https://api.smartthings.com/v1/devices/" .. device.deviceNetworkId .. "/commands"
+    local response_body = {}
+    local _, status_code, _, _ = http.request{
+        url = url,
+        method = "POST",
+        headers = headers,
+        source = ltn12.source.string(requestBody),
+        sink = ltn12.sink.table(response_body),
+    }
+    return status_code == 200 or status_code == 201 or status_code == 202
+end
+
+-- Define the driver function to refresh the garage door state
+local function refreshGarageDoorState(device)
+    local headers = {
+        ["Content-Type"] = "application/json",
+        ["Authorization"] = "Bearer " .. device.authToken
+    }
+    local url = "https://api.smartthings.com/v1/devices/" .. device.deviceNetworkId
+    local response_body = {}
+    local _, status_code, _, _ = http.request{
+        url = url,
+        method = "GET",
+        headers = headers,
+        sink = ltn12.sink.table(response_body),
+    }
+    local response_body_str = table.concat(response_body)
+    local response_data = json.decode(response_body_str)
+    local state = response_data.components.main.garageDoorControl.door.state.value
+    device:emit_event(capabilities.switch.switch[""..state..""])
+    device:emit_event(capabilities.contactSensor.contact[""..state..""])
+    device:emit_event(capabilities.sensor.sensor[""..state..""])
+end
+
+-- Define the driver function to initialize the device
+local function initializeDevice(device)
+    device:enable_component("main", "garageDoorControl")
+end
+
+-- Define the driver function to create the device
+local function createDevice(device)
+    device:add_capability(garage_door_opener_capabilities)
+    device:init {
+        profile = "smartthings/GarageDoorOpener",
+        lifecycle = {
+            added = initializeDevice,
+            deleted = function() end
+        },
+        capability_handlers = {
+            [capabilities.switch.ID] = {
+                [capabilities.switch.commands.on.NAME] = function(device)
+                    return setGarageDoorState(device, "open", "on", "open")
+                end,
+                [capabilities.switch.commands.off.NAME] = function(device)
+                    return setGarageDoorState(device, "close", "on", "closed")
+                end,
+            },
+            [capabilities.refresh.ID] = {
+                [capabilities.refresh.commands.refresh.NAME] = refreshGarageDoorState,
+            },
+        },
+    }
+end
+
+-- Define the driver function to update the device
+local function updateDevice(device, ...)
+    device:emit

@@ -1,0 +1,56 @@
+local capabilities = require "st.capabilities"
+local z_wave = require "st.zwave"
+
+local function get_command_class_report_handler(device, cmd)
+  if cmd.command_class == z_wave.command_classes.GARAGE_DOOR_OPENER then
+    if cmd:byte(3) == z_wave.command_classes.GARAGE_DOOR_OPENER.command_ids.GARAGE_DOOR_STATUS then
+      if cmd:byte(4) == 0x00 then
+        device:emit_event(capabilities.garageDoorControl.door.closed())
+      elseif cmd:byte(4) == 0xFF then
+        device:emit_event(capabilities.garageDoorControl.door.open())
+      elseif cmd:byte(4) == 0x01 then
+        device:emit_event(capabilities.garageDoorControl.door.closing())
+      elseif cmd:byte(4) == 0x02 then
+        device:emit_event(capabilities.garageDoorControl.door.opening())
+      end
+    end
+  end
+end
+
+local myq_garage_door_driver = {
+  NAME = "MyQ Garage Door Opener",
+  zwave_handlers = {
+    [z_wave.command_classes.NOTIFICATION] = {
+      [z_wave.notification_types.ACCESS_CONTROL] = {
+        [z_wave.access_control_events.OPENED] = function(device, cmd)
+          device:emit_event(capabilities.garageDoorControl.door.open())
+        end,
+        [z_wave.access_control_events.CLOSED] = function(device, cmd)
+          device:emit_event(capabilities.garageDoorControl.door.closed())
+        end
+      }
+    },
+    [z_wave.command_classes.APPLICATION_STATUS] = {
+      [z_wave.application_status_commands.REPORT] = get_command_class_report_handler
+    }
+  },
+  capability_handlers = {
+    [capabilities.garageDoorControl.ID] = {
+      [capabilities.garageDoorControl.commands.open.NAME] = function(device)
+        device:send(z_wave.GARAGE_DOOR_OPENER_SET(z_wave.garage_door_opener_commands.OPEN()))
+      end,
+      [capabilities.garageDoorControl.commands.close.NAME] = function(device)
+        device:send(z_wave.GARAGE_DOOR_OPENER_SET(z_wave.garage_door_opener_commands.CLOSE()))
+      end,
+      [capabilities.garageDoorControl.commands.setTarget.NAME] = function(device, command)
+        if command.arguments.target_value == "open" then
+          device:send(z_wave.GARAGE_DOOR_OPENER_SET(z_wave.garage_door_opener_commands.OPEN()))
+        elseif command.arguments.target_value == "close" then
+          device:send(z_wave.GARAGE_DOOR_OPENER_SET(z_wave.garage_door_opener_commands.CLOSE()))
+        end
+      end
+    }
+  }
+}
+
+return myq_garage_door_driver

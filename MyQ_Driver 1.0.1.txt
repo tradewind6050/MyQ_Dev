@@ -1,0 +1,101 @@
+local capabilities = require "st.capabilities"
+local zcl_clusters = require "st.zigbee.zcl.clusters"
+local device_management = require "st.zigbee.device_management"
+local myq = require "st.myq"
+local log = require "log"
+
+local function get_device_info(driver, device)
+  local manufacturer = device:get_manufacturer()
+  local model = device:get_model()
+  local firmware = device:get_firmware_version()
+  local serial_number = device:get_serial_number()
+
+  return {
+    manufacturer = manufacturer,
+    model = model,
+    firmware = firmware,
+    serial_number = serial_number
+  }
+end
+
+local function create_myq_device(driver, device)
+  local device_info = get_device_info(driver, device)
+
+  local myq_device = {
+    type = "myq_device",
+    device_network_id = device:get_field("network_address"),
+    manufacturer = device_info.manufacturer,
+    model = device_info.model,
+    firmware = device_info.firmware,
+    serial_number = device_info.serial_number,
+    door_state = "unknown"
+  }
+
+  device:emit_event(capabilities.refresh())
+
+  return myq_device
+end
+
+local function update_myq_device(driver, device, myq_device)
+  local device_info = get_device_info(driver, device)
+
+  myq_device.manufacturer = device_info.manufacturer
+  myq_device.model = device_info.model
+  myq_device.firmware = device_info.firmware
+  myq_device.serial_number = device_info.serial_number
+
+  device:emit_event(capabilities.refresh())
+
+  return myq_device
+end
+
+local function get_door_state_attribute_value(door_state)
+  if door_state == "closed" then
+    return 0x0000
+  elseif door_state == "open" then
+    return 0x0100
+  else
+    return 0xfffe
+  end
+end
+
+local function update_myq_device_door_state(driver, device, myq_device, door_state)
+  local attribute_value = get_door_state_attribute_value(door_state)
+
+  if attribute_value ~= myq_device.door_state then
+    myq_device.door_state = attribute_value
+
+    device:emit_event(capabilities.doorControl.door(door_state))
+    device:emit_event(capabilities.refresh())
+  end
+end
+
+local function handle_myq_report(driver, device, zb_rx)
+  local cluster_id = zb_rx:get_cluster_id()
+  local endpoint_id = zb_rx:get_source_endpoint()
+
+  if cluster_id == zcl_clusters.genBasic.ID and endpoint_id == 0x01 then
+    local report = zcl_clusters.genBasic.attributes.modelId:read(device)
+
+    log.info("Received report from device: " .. report.value)
+
+    local myq_device = device_management.find_device_by_network_id(report.value)
+
+    if myq_device then
+      update_myq_device(driver, device, myq_device)
+    else
+      myq_device = create_myq_device(driver, device)
+      device_management.add_device(myq_device)
+    end
+
+    return true
+  elseif cluster_id == zcl_clusters.doorLock.ID and endpoint_id == 0x01 then
+    local report = zcl_clusters.doorLock.attributes.lockState:read(device)
+
+    log.info("Received report from device: " .. report.value)
+
+    local myq_device = device_management.find_device_by_network_id(device:get_field("modelId"))
+
+    if myq_device then
+      if report.value == 0x00 then
+        update_myq_device_door_state(driver, device,

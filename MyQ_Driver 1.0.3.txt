@@ -1,0 +1,553 @@
+local capabilities = require "st.capabilities"
+local Driver = require "st.driver"
+local oauth = require "st.oauth"
+local http = require "socket.http"
+local json = require "json"
+
+-- Define capabilities for garage door opener
+local garage_door_opener = capabilities["garageDoorControl"]
+
+-- Define constants for MyQ API endpoints and OAuth2 authorization
+local MYQ_API_URL = "https://api.myqdevice.com/api/v5"
+local MYQ_APP_ID = "MYQ_APP_ID"
+local MYQ_APP_SECRET = "MYQ_APP_SECRET"
+local MYQ_SCOPE = "MyQResidential"
+
+-- Define functions for MyQ API requests
+local function myq_request(method, endpoint, headers, body)
+  local response_body = {}
+  local response, status, headers = http.request {
+    method = method,
+    url = MYQ_API_URL .. endpoint,
+    headers = headers,
+    source = ltn12.source.string(body),
+    sink = ltn12.sink.table(response_body),
+  }
+  return json.decode(table.concat(response_body)), status, headers
+end
+
+local function myq_login(email, password)
+  local headers = {
+    ["MyQApplicationId"] = MYQ_APP_ID,
+    ["Content-Type"] = "application/json",
+  }
+  local body = json.encode({
+    ["Username"] = email,
+    ["Password"] = password,
+    ["ApplicationId"] = MYQ_APP_ID,
+  })
+  local data, status, headers = myq_request("POST", "/User/Validate", headers, body)
+  return data.SecurityToken
+end
+
+local function myq_get_devices(token)
+  local headers = {
+    ["MyQApplicationId"] = MYQ_APP_ID,
+    ["SecurityToken"] = token,
+    ["Content-Type"] = "application/json",
+  }
+  local data, status, headers = myq_request("GET", "/UserDeviceDetails", headers)
+  local devices = {}
+  for _, device in ipairs(data.Devices) do
+    if device.MyQDeviceTypeName == "GarageDoorOpener" then
+      table.insert(devices, device)
+    end
+  end
+  return devices
+end
+
+local function myq_set_door_state(token, device_id, state)
+  local headers = {
+    ["MyQApplicationId"] = MYQ_APP_ID,
+    ["SecurityToken"] = token,
+    ["Content-Type"] = "application/json",
+  }
+  local body = json.encode({
+    ["Attribute"] = "desireddoorstate",
+    ["Value"] = state,
+  })
+  local data, status, headers = myq_request("PUT", "/DeviceAttribute/" .. device_id .. "/putDeviceAttribute", headers, body)
+  return status == 200 and data.Attribute.Value == state
+end
+
+-- Define driver
+local garage
+local function garage_door_opener_command_handler(driver, device, command)
+local token = device.preferences.token
+local device_id = device.preferences.device_id
+if command.command == "open" then
+myq_set_door_state(token, device_id, 1)
+device:emit_event(garage_door_opener.opened())
+elseif command.command == "close" then
+myq_set_door_state(token, device_id, 0)
+device:emit_event(garage_door_opener.closed())
+elseif command.command == "refresh" then
+device:emit_event(garage_door_opener.refresh())
+end
+end
+
+local function garage_door_opener_event_handler(driver, device, event)
+if event.attribute == "doorstate" then
+if event.value == 1 then
+device:emit_event(garage_door_opener.opened())
+elseif event.value == 0 then
+device:emit_event(garage_door_opener.closed())
+end
+end
+end
+
+local function garage_door_opener_init_handler(driver, device)
+local token = device.preferences.token
+local devices = myq_get_devices(token)
+local device_id = nil
+for _, device in ipairs(devices) do
+if device.SerialNumber == device.preferences.serial_number then
+device_id = device.MyQDeviceId
+break
+end
+end
+device.preferences.device_id = device_id
+driver:send_command(device, garage_door_opener.refresh())
+end
+
+local function garage_door_opener_discover_handler(driver, device)
+local devices = myq_get_devices(device.preferences.token)
+for _, device in ipairs(devices) do
+if device.MyQDeviceTypeName == "GarageDoorOpener" then
+driver:add_device({
+type = "garage_door_opener",
+preferences = {
+token = device.preferences.token,
+serial_number = device.SerialNumber,
+},
+capabilities = {
+garage_door_opener,
+},
+discovery = {
+completed = true,
+},
+})
+end
+end
+end
+
+local garage_driver = Driver("garage_door_opener", {
+supported_capabilities = {
+garage_door_opener,
+},
+capability_handlers = {
+[garage_door_opener.ID] = {
+[garage_door_opener.commands.open.NAME] = garage_door_opener_command_handler,
+[garage_door_opener.commands.close.NAME] = garage_door_opener_command_handler,
+[garage_door_opener.commands.refresh.NAME] = garage_door_opener_command_handler,
+},
+},
+lifecycle_handlers = {
+init = garage_door_opener_init_handler,
+discover = garage_door_opener_discover_handler,
+},
+event_handlers = {
+[garage_door_opener.ID] = garage_door_opener_event_handler,
+},
+})
+
+-- Define OAuth2 authorization
+local oauth_handler = oauth.build_simple_authorization_handler(MYQ_APP_ID, MYQ_APP_SECRET, MYQ_SCOPE)
+
+-- Define configuration page
+local function garage_door_opener_configuration_page_handler(driver, device, configuration)
+if configuration.auth then
+local access_token, expires_in = oauth_handler:fetch_token(configuration.auth.code)
+device.preferences.token = access_token
+configuration.status = "success"
+configuration.message = "Authorization successful"
+end
+return {
+auth_url = oauth_handler:get_authorization_url(),
+callback_url = driver.config:get("server.url") .. "/device/auth/callback",
+}
+end
+
+garage_driver:run {
+server = require "st.server",
+configuration_schema = {
+type = "object",
+properties = {
+auth = {
+type = "object",
+    title = "Authorization",
+    properties = {},
+  },
+},
+required = { "auth" },
+},
+configuration_page = garage_door_opener_configuration_page_handler,
+}
+
+-- Define MyQ API functions
+function myq_get_devices(token)
+local url = string.format("%s/api/v4/UserDeviceDetails", MYQ_API_BASE_URL)
+local headers = {
+["User-Agent"] = MYQ_USER_AGENT,
+["SecurityToken"] = token,
+}
+local response = http.request("GET", url, "", headers)
+return json.decode(response.body).Devices
+end
+
+function myq_set_door_state(token, device_id, state)
+local url = string.format("%s/api/v4/DeviceAttribute/PutDeviceAttribute", MYQ_API_BASE_URL)
+local headers = {
+["User-Agent"] = MYQ_USER_AGENT,
+["SecurityToken"] = token,
+["Content-Type"] = "application/json",
+}
+local payload = {
+AttributeName = "desireddoorstate",
+MyQDeviceId = device_id,
+AttributeValue = state,
+}
+local response = http.request("PUT", url, json.encode(payload), headers)
+return response.status == 200
+end
+
+-- Define garage door opener capability
+local garage_door_opener = Capability "garageDoorControl" {
+attributes = {
+doorState = Attribute "enum" {
+values = { "open", "closed", "opening", "closing", "stopped" },
+initial = "closed",
+},
+},
+commands = {
+open = Command {},
+close = Command {},
+refresh = Command {},
+},
+events = {
+opened = Event {},
+closed = Event {},
+opening = Event {},
+closing = Event {},
+stopped = Event {},
+unknown = Event {},
+refresh = Event {},
+},
+}
+
+-- Define garage door opener state values
+local DOOR_STATE = {
+[0] = "closed",
+[1] = "open",
+[2] = "stopped",
+[3] = "opening",
+[4] = "closing",
+}
+
+-- Define garage door opener event mapping
+local EVENT_MAPPING = {
+[1] = "opened",
+[0] = "closed",
+[2] = "stopped",
+[3] = "opening",
+[4] = "closing",
+}
+
+-- Define garage door opener state mapping
+local STATE_MAPPING = {
+["open"] = 1,
+["closed"] = 0,
+}
+
+-- Define MyQ constants
+local MYQ_API_BASE_URL = "https://myqexternal.myqdevice.com"
+local MYQ_USER_AGENT = "Chamberlain/3.73"
+local MYQ_APP_ID = "MYQ_APP_ID"
+local MYQ_APP_SECRET = "MYQ_APP_SECRET"
+local MYQ_SCOPE = "MyQ_Residential"
+local MYQ_AUTHORIZATION_URL = string.format("%s/oauth2/authorize", MYQ_API_BASE_URL)
+local MYQ_TOKEN_URL = string.format("%s/oauth2/token", MYQ_API_BASE_URL)
+-- Define garage door opener driver
+local garage_door_opener_driver = Driver "garage-door-opener" {
+capability = {
+garage_door_opener,
+},
+lifecycle = {
+init = garage_door_opener_init_handler,
+install = garage_door_opener_install_handler,
+update = garage_door_opener_update_handler,
+},
+capability_handlers = {
+[garage_door_opener] = {
+open = garage_door_opener_open_handler,
+close = garage_door_opener_close_handler,
+refresh = garage_door_opener_refresh_handler,
+},
+},
+}
+
+-- Define garage door opener driver initialization handler
+function garage_door_opener_init_handler(driver, device)
+device:set_field("doorState", "closed")
+end
+
+-- Define garage door opener driver installation handler
+function garage_door_opener_install_handler(driver, device, ...)
+local auth = device.preferences.auth
+local devices = myq_get_devices(auth.access_token)
+for _, dev in ipairs(devices) do
+if dev.MyQDeviceTypeName == "GarageDoorOpener" then
+device:set_field("label", dev.DeviceName)
+device.preferences.device_id = dev.MyQDeviceId
+break
+end
+end
+end
+
+-- Define garage door opener driver update handler
+function garage_door_opener_update_handler(driver, device, ...)
+garage_door_opener_install_handler(driver, device, ...)
+end
+
+-- Define garage door opener open handler
+function garage_door_opener_open_handler(driver, device)
+local auth = device.preferences.auth
+local device_id = device.preferences.device_id
+if myq_set_door_state(auth.access_token, device_id, STATE_MAPPING["open"]) then
+device:set_field("doorState", "opening")
+device:emit_event(garage_door_opener.events.opening{})
+end
+end
+
+-- Define garage door opener close handler
+function garage_door_opener_close_handler(driver, device)
+local auth = device.preferences.auth
+local device_id = device.preferences.device_id
+if myq_set_door_state(auth.access_token, device_id, STATE_MAPPING["closed"]) then
+device:set_field("doorState", "closing")
+device:emit_event(garage_door_opener.events.closing{})
+end
+end
+
+-- Define garage door opener refresh handler
+function garage_door_opener_refresh_handler(driver, device)
+local auth = device.preferences.auth
+local device_id = device.preferences.device_id
+local devices = myq_get_devices(auth.access_token)
+for _, dev in ipairs(devices) do
+if dev.MyQDeviceId == device_id then
+local door_state = DOOR_STATE[dev.Attributes[1].Value]
+if door_state then
+device:set_field("doorState", door_state)
+device:emit_event(garage_door_opener.events[EVENT_MAPPING[dev.Attributes[1].Value]]{})
+else
+device:set_field("doorState", "unknown")
+device:emit_event(garage_door_opener.events.unknown{})
+end
+break
+end
+end
+device:emit_event(garage_door_opener.events.refresh{})
+end
+
+-- Register garage door opener driver
+register_driver(garage_door_opener_driver)
+-- Define MyQ API endpoint URLs
+local MYQ_API_BASE_URL = "https://myqexternal.myqdevice.com/api/v4"
+local MYQ_API_LOGIN_URL = MYQ_API_BASE_URL .. "/user/validate"
+local MYQ_API_DEVICES_URL = MYQ_API_BASE_URL .. "/userdevicedetails/get"
+
+-- Define garage door opener state mapping
+local STATE_MAPPING = {
+open = 1,
+closed = 0,
+}
+
+-- Define MyQ door state mapping
+local DOOR_STATE = {
+[STATE_MAPPING["open"]] = "open",
+[STATE_MAPPING["closed"]] = "closed",
+}
+
+-- Define MyQ event mapping
+local EVENT_MAPPING = {
+[STATE_MAPPING["open"]] = "opened",
+[STATE_MAPPING["closed"]] = "closed",
+}
+
+-- Define MyQ API authentication
+function myq_authenticate(username, password)
+local response = http.post(MYQ_API_LOGIN_URL, {
+headers = {
+["Content-Type"] = "application/json",
+},
+data = {
+Username = username,
+Password = password,
+},
+})
+return response.status == 200 and json.decode(response.body) or nil
+end
+
+-- Define MyQ API device retrieval
+function myq_get_devices(access_token)
+local response = http.post(MYQ_API_DEVICES_URL, {
+headers = {
+["Content-Type"] = "application/json",
+["Authorization"] = "Bearer " .. access_token,
+},
+data = {},
+})
+return response.status == 200 and json.decode(response.body).Devices or {}
+end
+
+-- Define MyQ API door state setter
+function myq_set_door_state(access_token, device_id, state)
+local response = http.put(MYQ_API_BASE_URL .. "/DeviceAttribute/PutDeviceAttribute", {
+headers = {
+["Content-Type"] = "application/json",
+["Authorization"] = "Bearer " .. access_token,
+},
+data = {
+AttributeName = "desireddoorstate",
+MyQDeviceId = device_id,
+AttributeValue = state,
+},
+})
+return response.status == 200 and json.decode(response.body).AttributeValue == state
+end
+
+-- Export module functions
+return {
+authenticate = myq_authenticate,
+get_devices = myq_get_devices,
+set_door_state = myq_set_door_state,
+}
+-- Import required modules
+local capabilities = require "st.capabilities"
+local http = require "http"
+local json = require "dkjson"
+local myq_api = require "myq_api"
+
+-- Define constants
+local MYQ_DEVICE_TYPE = "GarageDoorOpener"
+local MYQ_REFRESH_INTERVAL = 30 -- in seconds
+
+-- Define device profile
+local function get_device_profile()
+return {
+metadata = {
+-- Add metadata about your driver here
+-- e.g. vendor, device type, model, icon, etc.
+},
+capability_handlers = {
+[capabilities.switch.ID] = {
+[capabilities.switch.commands.on.NAME] = handle_switch_on,
+[capabilities.switch.commands.off.NAME] = handle_switch_off,
+},
+[capabilities.refresh.ID] = {
+[capabilities.refresh.commands.refresh.NAME] = handle_refresh,
+},
+},
+}
+end
+f
+-- Define device commands
+local function handle_switch_on(driver, device)
+local access_token = device.preferences.access_token
+local device_id = device.preferences.device_id
+local state = myq_api.STATE_MAPPING["open"]
+myq_api.set_door_state(access_token, device_id, state)
+device:emit_event(capabilities.switch.switch.on())
+end
+
+local function handle_switch_off(driver, device)
+local access_token = device.preferences.access_token
+local device_id = device.preferences.device_id
+local state = myq_api.STATE_MAPPING["closed"]
+myq_api.set_door_state(access_token, device_id, state)
+device:emit_event(capabilities.switch.switch.off())
+end
+
+local function handle_refresh(driver, device)
+local access_token = device.preferences.access_token
+local device_id = device.preferences.device_id
+local devices = myq_api.get_devices(access_token)
+for _, device in ipairs(devices) do
+if device.MyQDeviceTypeName == MYQ_DEVICE_TYPE and device.MyQDeviceId == device_id then
+local state = device.Attributes.AttributeInfo.DesiredDoorState.Value
+device:emit_event(capabilities.switch.switchstate == myq_api.STATE_MAPPING["open"] and "on" or "off")
+break
+end
+end
+device:emit_event(capabilities.refresh.refresh())
+end
+
+-- Define driver lifecycle functions
+local function device_added(driver, device)
+device.thread = fiber.create(function()
+while true do
+handle_refresh(driver, device)
+fiber.sleep(MYQ_REFRESH_INTERVAL)
+end
+end)
+end
+
+local function device_removed(driver, device)
+if device.thread then
+fiber.cancel(device.thread)
+device.thread = nil
+end
+end
+
+-- Register driver
+local myq_driver = {
+name = "Samsung SmartThings Edge MyQ Garage Door Opener Driver",
+get_profile = get_device_profile,
+lifecycle = {
+added = device_added,
+removed = device_removed,
+},
+}
+
+-- Export driver
+return myq_driver
+-- Define configuration UI
+local function get_configuration_steps()
+  return {
+    {
+      title = "MyQ Login",
+      ui_component = "text_input",
+      label = "Email",
+      key = "username",
+      type = "string",
+    },
+    {
+      ui_component = "password_input",
+      label = "Password",
+      key = "password",
+      type = "string",
+    },
+    {
+      title = "Select Garage Door Opener",
+      ui_component = "device_selector",
+      label = "Garage Door Opener",
+      key = "device_id",
+      capabilities = { "garageDoorControl" },
+    },
+  }
+end
+
+-- Define configuration lifecycle functions
+local function configuration_init(driver, device)
+  device:configure(get_configuration_steps())
+end
+
+local function configuration_added(driver, device, configuration)
+  device.preferences.access_token = myq_api.authenticate(configuration.username, configuration.password).SecurityToken
+  device.preferences.device_id = configuration.device_id.id
+end
+
+-- Update driver lifecycle
+myq_driver.lifecycle.init = configuration_init
+myq_driver.lifecycle.added = configuration_added
